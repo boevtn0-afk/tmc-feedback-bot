@@ -198,6 +198,22 @@ async def cmd_start(message: Message) -> None:
     )
 
 
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    text = (
+        "Я собираю обратную связь по <b>«Учёт ТМЦ»</b>. Просто пишите сюда, "
+        "что не так или что стоит добавить — можно со скриншотом, можно словами.\n"
+    )
+    if is_admin(message):
+        text += (
+            "\n<b>Команды администратора:</b>\n"
+            "/export — выгрузить переписку (Markdown + JSON)\n"
+            "/stats — статистика по сообщениям и чатам\n"
+            "/whereami — id текущего чата"
+        )
+    await message.answer(text)
+
+
 @router.message(Command("whereami"))
 async def cmd_whereami(message: Message) -> None:
     await message.answer(
