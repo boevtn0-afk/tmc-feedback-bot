@@ -1,0 +1,17 @@
+[Unit]
+Description=TMC Feedback Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/feedback-bot
+EnvironmentFile=/opt/feedback-bot/.env
+ExecStart=/opt/feedback-bot/.venv/bin/python /opt/feedback-bot/bot.py
+Restart=always
+RestartSec=5
+# Опционально: отдельный каталог для БД (совпадает с DB_PATH в .env)
+# StateDirectory=feedback-bot
+
+[Install]
+WantedBy=multi-user.target
