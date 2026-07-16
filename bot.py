@@ -92,7 +92,39 @@ def init_db() -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS export_state (id INTEGER PRIMARY KEY, last_id INTEGER)"
         )
+        # Реестр чатов, где работает бот (для статус-сообщений о выгрузке).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chats "
+            "(chat_id INTEGER PRIMARY KEY, chat_title TEXT, chat_type TEXT)"
+        )
+        # Засеять уже известными группами из накопленных сообщений.
+        conn.execute(
+            "INSERT OR IGNORE INTO chats (chat_id, chat_title, chat_type) "
+            "SELECT chat_id, chat_title, chat_type FROM messages "
+            "WHERE chat_type IN ('group', 'supergroup') GROUP BY chat_id"
+        )
         conn.commit()
+
+
+def remember_chat(chat_id: int, chat_title: str, chat_type: str) -> None:
+    """Запоминает групповой чат, где работает бот."""
+    if chat_type not in ("group", "supergroup"):
+        return
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "INSERT INTO chats (chat_id, chat_title, chat_type) VALUES (?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET chat_title = excluded.chat_title",
+            (chat_id, chat_title, chat_type),
+        )
+        conn.commit()
+
+
+def known_group_chats() -> list[int]:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM chats WHERE chat_type IN ('group', 'supergroup')"
+        ).fetchall()
+        return [r[0] for r in rows]
 
 
 def get_cursor() -> int:
@@ -186,6 +218,11 @@ async def download_photo(bot: Bot, message: Message) -> str | None:
 
 
 async def log_message(message: Message, bot: Bot) -> None:
+    remember_chat(
+        message.chat.id,
+        message.chat.title or message.chat.full_name or "—",
+        message.chat.type,
+    )
     text = message.text or message.caption
     photo_file = await download_photo(bot, message)
     if not text and not photo_file:
@@ -351,57 +388,59 @@ async def cmd_export_all(message: Message) -> None:
     await send_export(message.bot, message.chat.id, rows, "Полная переписка")
 
 
+async def post_status_to_chats(bot: Bot, text: str) -> None:
+    """Статус-сообщение о выгрузке во все чаты, где работает бот."""
+    for chat_id in known_group_chats():
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Статус -> %s: %s", chat_id, e)
+
+
 async def do_auto_export(bot: Bot, *, notify_empty: bool) -> None:
-    """Авто-выгрузка нового: файлы + подтверждение админам, сервис-сообщение в группу."""
+    """Авто-выгрузка нового: файлы админам в личку + статус в чат(ы) бота."""
     rows = fetch_since(get_cursor())
-    if not rows:
+    n = len(rows)
+    n_photos = sum(1 for r in rows if r["photo_file"])
+    delivered = False
+
+    if rows:
+        # Файлы + короткое подтверждение — админам в личку
+        for admin_id in ADMIN_IDS:
+            try:
+                await send_export(bot, admin_id, rows, "Авто-выгрузка (новое)")
+                await bot.send_message(
+                    admin_id,
+                    f"✅ Авто-выгрузка выполнена: {n} новых сообщений, {n_photos} скринов.",
+                )
+                delivered = True
+            except Exception as e:  # noqa: BLE001
+                log.warning("Auto-export -> %s не удалась: %s", admin_id, e)
+        if delivered:
+            set_cursor(max(r["id"] for r in rows))
+    else:
+        delivered = True  # пустой прогон — тоже успешный
         if notify_empty:
             for admin_id in ADMIN_IDS:
                 try:
                     await bot.send_message(
-                        admin_id,
-                        "🔄 Авто-выгрузка: новых сообщений с прошлой выгрузки нет.",
+                        admin_id, "🔄 Авто-выгрузка: новой обратной связи за период нет."
                     )
                 except Exception as e:  # noqa: BLE001
                     log.warning("Auto-export notify -> %s: %s", admin_id, e)
-        else:
-            log.info("Auto-export: нет новых, пропуск.")
-        return
 
-    new_cursor = max(r["id"] for r in rows)
-    n_photos = sum(1 for r in rows if r["photo_file"])
+    if not delivered:
+        return  # не удалось доставить админам — статус в чат не постим
 
-    # 1) Файлы + короткое подтверждение — админам в личку
-    sent = False
-    for admin_id in ADMIN_IDS:
-        try:
-            await send_export(bot, admin_id, rows, "Авто-выгрузка (новое)")
-            await bot.send_message(
-                admin_id,
-                f"✅ Авто-выгрузка выполнена: {len(rows)} новых сообщений, {n_photos} скринов.",
-            )
-            sent = True
-        except Exception as e:  # noqa: BLE001
-            log.warning("Auto-export -> %s не удалась: %s", admin_id, e)
-
-    if not sent:
-        return  # не удалось никому — метку не двигаем и в группу не пишем
-
-    # 2) Сервисное сообщение в группы, попавшие в эту выгрузку
-    group_chats = {
-        r["chat_id"] for r in rows if r["chat_type"] in ("group", "supergroup")
-    }
-    for chat_id in group_chats:
-        try:
-            await bot.send_message(
-                chat_id,
-                "🔄 Обратная связь за период выгружена администратору. "
-                "Спасибо! Продолжайте писать, что улучшить.",
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("Service msg -> %s: %s", chat_id, e)
-
-    set_cursor(new_cursor)
+    # Статус выгрузки — в чат(ы), где работает бот
+    if rows:
+        status = (
+            f"📤 Авто-выгрузка выполнена: {n} новых сообщений переданы администратору. "
+            "Спасибо! Продолжайте писать, что улучшить."
+        )
+    else:
+        status = "📤 Авто-выгрузка: новой обратной связи за период нет."
+    await post_status_to_chats(bot, status)
 
 
 async def scheduled_export(bot: Bot) -> None:
@@ -453,6 +492,11 @@ async def cmd_stats(message: Message) -> None:
 async def on_added(message: Message, bot: Bot) -> None:
     me = await bot.me()
     if any(u.id == me.id for u in message.new_chat_members):
+        remember_chat(
+            message.chat.id,
+            message.chat.title or message.chat.full_name or "—",
+            message.chat.type,
+        )
         await message.answer(
             "Привет! 👋 Я собираю обратную связь по <b>«Учёт ТМЦ»</b>.\n\n"
             "Просто пишите сюда, что не так или что стоит добавить — "
