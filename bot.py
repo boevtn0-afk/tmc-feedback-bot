@@ -31,7 +31,7 @@ import logging
 import os
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -502,6 +502,17 @@ async def main() -> None:
             CronTrigger(hour=DAILY_EXPORT_HOUR_UTC, minute=0),
             args=[bot],
             id="daily_export",
+            replace_existing=True,
+        )
+        # ВРЕМЕННО (демо): разовый авто-прогон через 90 сек после старта,
+        # чтобы показать, что расписание срабатывает само. Убрать после проверки.
+        scheduler.add_job(
+            do_auto_export,
+            "date",
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=90),
+            args=[bot],
+            kwargs={"notify_empty": True},
+            id="oneoff_demo",
             replace_existing=True,
         )
     scheduler.start()
